@@ -70,6 +70,7 @@ import {
   type Requirement,
 } from './lib/providers.ts';
 import { anthropicError, anthropicModelList, openAIError, openAIModelList, type ServedModel } from './lib/wire.ts';
+import { Ledger, pick } from './lib/plan.ts';
 import {
   anthropicJson,
   anthropicSse,
@@ -138,30 +139,15 @@ interface Route {
   rating: number;
 }
 
-/** The most calls each provider can take in a trial (the top of its drawn budget): a call past it is refused. */
-const CALLS_CEILING: Record<string, number> = {
-  groq: 12,
-  cerebras: 6,
-  gemini: 8,
-  zai: 5,
-  openrouter: 12,
-  sambanova: 5,
-  pollinations: 14,
-  cloudflare: 8,
-  ovh: 6,
-  kilol: 16,
-};
-/** How many times one provider is tried for one request before it is given up for the trial. */
-const ATTEMPTS = 3;
+/** How many refusals one model may give one request before it is set aside. */
+const MAX_REFUSALS = 2;
 /** The longest a retry-after is waited out, in milliseconds. */
 const MAX_RETRY_WAIT_MS = 1500;
 /** How long one provider call may take, in milliseconds. */
 const CALL_TIMEOUT_MS = 20000;
 
-/** Providers given up for the trial: refused every attempt, or past their ceiling. */
-const dead = new Set<string>();
-/** Calls this server has made to each provider that counted against its budget. */
-const callsMade = new Map<string, number>();
+/** What has been learned of each provider's budget from the calls made so far. */
+const ledger = new Ledger();
 
 /**
  * Every free model meeting the requirements, best first: the quality table's rating, then the provider's
@@ -170,7 +156,7 @@ const callsMade = new Map<string, number>();
 function candidatesFor(requires: Requirement, json: boolean): Route[] {
   const out: Route[] = [];
   for (const probe of probes) {
-    if (!probe.ok || dead.has(probe.provider.id)) continue;
+    if (!probe.ok) continue;
     if (json && probe.provider.wire === 'anthropic') continue;
     for (const model of probe.models) {
       const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
@@ -184,12 +170,12 @@ function candidatesFor(requires: Requirement, json: boolean): Route[] {
 }
 
 /** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own. */
-function requirementsFor(api: 'openai' | 'anthropic', body: Json): Requirement {
+function requirementsFor(api: 'openai' | 'anthropic', body: Json): { requires: Requirement; weight: number } {
   const manifest = brief.workload?.manifest ?? [];
   const entry = manifest[manifestIndex];
   manifestIndex += 1;
-  if (entry !== undefined && entry.api === api) return entry.requires;
-  return requirementsFromBody(body);
+  if (entry !== undefined && entry.api === api) return { requires: entry.requires, weight: entry.weight };
+  return { requires: requirementsFromBody(body), weight: 1 };
 }
 
 /** Requirements read off a request body, when the manifest has no row for it. */
@@ -278,8 +264,9 @@ async function callOnce(route: Route, canon: Json, anthropicVersion: string): Pr
     log(`${provider.id}/${route.model.id}: ${(err as Error).message}`);
     return { kind: 'refused', waitMs: 0 };
   }
-  if (status !== 400 && status !== 401) callsMade.set(provider.id, (callsMade.get(provider.id) ?? 0) + 1);
+  const counted = status !== 400 && status !== 401;
   if (status === 402 || status === 429 || status >= 500) {
+    if (counted) ledger.record(provider.id, false);
     const seconds = Number(retryAfter);
     return { kind: 'refused', waitMs: Number.isFinite(seconds) && seconds > 0 ? Math.min(seconds * 1000, MAX_RETRY_WAIT_MS) : 0 };
   }
@@ -295,31 +282,34 @@ async function callOnce(route: Route, canon: Json, anthropicVersion: string): Pr
   }
   if (!isRecord(json)) return { kind: 'rejected' };
   const result = provider.wire === 'openai' ? fromOpenAI(json, route.model.id) : provider.wire === 'anthropic' ? fromAnthropic(json, route.model.id) : fromGemini(json, route.model.id);
-  return result === null ? { kind: 'rejected' } : { kind: 'ok', result };
+  if (result === null) return { kind: 'rejected' };
+  ledger.record(provider.id, true);
+  return { kind: 'ok', result };
 }
 
 /**
- * Answer one request with the best free model that takes it. A refusal (402, 429, 5xx) is retried on the
- * same provider, waiting out a retry-after, since a scheduled refusal clears on the next call; a provider
- * that refuses every attempt, or has been called past its ceiling, is given up for the trial.
+ * Answer one request. Each call goes to the model that loses the least rating once the chance of a refusal
+ * is priced in (see lib/plan.ts): a provider's first call is never refused, so fresh providers are used for
+ * a rating within a few points of the best. A refusal is learned from and the next pick made afresh; a
+ * retry-after is waited out only when the same provider is picked again.
  */
-async function answer(canon: Json, requires: Requirement, anthropicVersion: string): Promise<Result | null> {
-  const tried = new Set<string>();
+async function answer(canon: Json, requires: Requirement, weight: number, anthropicVersion: string): Promise<Result | null> {
+  const all = candidatesFor(requires, false);
+  const best = all.reduce((m, r) => Math.max(m, r.rating), 0);
+  const pool = candidatesFor(requires, wantsJson(canon));
+  const refusals = new Map<Route, number>();
+  let waitFor: { provider: string; ms: number } | null = null;
   for (;;) {
-    const route = candidatesFor(requires, wantsJson(canon)).find((r) => !tried.has(`${r.probe.provider.id}/${r.model.id}`));
-    if (route === undefined) return null;
-    const id = route.probe.provider.id;
-    tried.add(`${id}/${route.model.id}`);
-    for (let attempt = 1; attempt <= ATTEMPTS; attempt += 1) {
-      const outcome = await callOnce(route, canon, anthropicVersion);
-      if (outcome.kind === 'ok') return outcome.result;
-      if (outcome.kind === 'rejected') break;
-      if ((callsMade.get(id) ?? 0) >= (CALLS_CEILING[id] ?? Infinity) || attempt === ATTEMPTS) {
-        dead.add(id);
-        break;
-      }
-      if (outcome.waitMs > 0) await sleep(outcome.waitMs);
-    }
+    const open = pool.filter((r) => (refusals.get(r) ?? 0) < MAX_REFUSALS);
+    const at = pick(open.map((r) => ({ provider: r.probe.provider.id, rating: r.rating })), ledger, best, weight);
+    if (at < 0) return null;
+    const route = open[at];
+    if (waitFor !== null && waitFor.provider === route.probe.provider.id && waitFor.ms > 0) await sleep(waitFor.ms);
+    waitFor = null;
+    const outcome = await callOnce(route, canon, anthropicVersion);
+    if (outcome.kind === 'ok') return outcome.result;
+    refusals.set(route, (refusals.get(route) ?? 0) + (outcome.kind === 'refused' ? 1 : MAX_REFUSALS));
+    if (outcome.kind === 'refused') waitFor = { provider: route.probe.provider.id, ms: outcome.waitMs };
   }
 }
 
@@ -329,7 +319,8 @@ async function serve(api: 'openai' | 'anthropic', req: IncomingMessage, res: Ser
   if (body === null) return sendError(res, api, 400, 'invalid_request_error', 'the request body is not one JSON object');
   const canon = canonical(api, body);
   const version = typeof req.headers['anthropic-version'] === 'string' ? req.headers['anthropic-version'] : '2023-06-01';
-  const result = await answer(canon, requirementsFor(api, body), version);
+  const need = requirementsFor(api, body);
+  const result = await answer(canon, need.requires, need.weight, version);
   if (result === null) {
     return sendError(res, api, 503, api === 'anthropic' ? 'overloaded_error' : 'no_free_model', 'no free model could answer this request');
   }
